@@ -1,11 +1,9 @@
 import cv2
 import numpy as np
+import time
 import mediapipe as mp
 from PIL import ImageFont, ImageDraw, Image
-from tensorflow.keras.models import load_model
-import tensorflow as tf
-print("TF Version:", tf.__version__)
-print("GPU 사용 가능?", tf.config.list_physical_devices('GPU'))
+from tflite_runtime.interpreter import Interpreter
 
 # 설정
 actions = [
@@ -14,7 +12,7 @@ actions = [
 ]
 seq_length = 10
 expected_feature_dim = 55  # 학습 시 사용한 피처 수
-# 중복 제거된 얼굴 랜드마크 인덱스
+
 USED_FACE_INDEXES = list(dict.fromkeys([
     33, 133, 362, 263, 1, 61, 291, 199, 429, 152,
     234, 454, 138, 172, 136, 215, 177, 398, 367,
@@ -49,20 +47,24 @@ def draw_text_on_image(img, text):
     return np.array(img_pil)
 
 def load_tflite_model(path):
-    interpreter = tf.lite.Interpreter(model_path=path)
+    interpreter = Interpreter(model_path=path)
     interpreter.allocate_tensors()
     return interpreter
 
 def predict_action(interpreter, input_data):
     input_details = interpreter.get_input_details()
     output_details = interpreter.get_output_details()
+
+    # 입력 데이터 (1, 10, 55)로 고정
+    input_data = np.array(input_data, dtype=np.float32).reshape(1, seq_length, expected_feature_dim)
+
     interpreter.set_tensor(input_details[0]['index'], input_data)
     interpreter.invoke()
+
     return interpreter.get_tensor(output_details[0]['index'])[0]
 
 def main():
-    interpreter = load_tflite_model('models/multi_face_expression_classifier.tflite')
-
+    interpreter = load_tflite_model('models/multi_face_expression_classifier_vlow.tflite')
     mp_face_mesh = mp.solutions.face_mesh
     face_mesh = mp_face_mesh.FaceMesh(
         max_num_faces=1,
@@ -71,6 +73,7 @@ def main():
         min_tracking_confidence=0.5
     )
     cap = cv2.VideoCapture(0)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # 버퍼 최소화
 
     seq = []
     action_seq = []
@@ -89,39 +92,41 @@ def main():
             face = results.multi_face_landmarks[0]
             coords = []
             for i in USED_FACE_INDEXES[:expected_feature_dim]:
-                try:
+                if i < len(face.landmark):
                     lm = face.landmark[i]
-                    coords.append([lm.x, lm.y])
-                except:
-                    coords.append([0.0, 0.0])
+                    coords.extend([lm.x, lm.y])
+                else:
+                    coords.extend([0.0, 0.0])
 
-            input_feature = np.array(coords).flatten()
+            # 피처 수 불일치 보정
+            if len(coords) != expected_feature_dim * 2:
+                print(f"[경고] 피처 수 불일치: {len(coords)}")
+                coords.extend([0.0] * (expected_feature_dim * 2 - len(coords)))
 
-            # 누락된 값 보정
-            if input_feature.shape[0] != expected_feature_dim * 2:
-                print(f"[경고] 피처 수 불일치: {input_feature.shape[0]}")
-                while input_feature.shape[0] < expected_feature_dim * 2:
-                    input_feature = np.append(input_feature, [0.0])
+            input_feature = np.array(coords, dtype=np.float32)
 
+            # 시퀀스 추가
             seq.append(input_feature)
-            if len(seq) < seq_length:
-                continue
+            if len(seq) > seq_length:
+                seq.pop(0)  # 오래된 데이터 삭제하여 메모리 절약
 
-            input_data = np.expand_dims(np.array(seq[-seq_length:], dtype=np.float32), axis=0)
-            y_pred = predict_action(interpreter, input_data)
+            # (1, 10, 55)로 입력 변환
+            if len(seq) == seq_length:
+                input_data = np.array(seq, dtype=np.float32).reshape(1, 10, 55)
+                y_pred = predict_action(interpreter, input_data)
 
-            i_pred = int(np.argmax(y_pred))
-            conf = y_pred[i_pred]
-            if conf < 0.9:
-                continue
+                i_pred = int(np.argmax(y_pred))
+                conf = y_pred[i_pred]
+                if conf < 0.9:
+                    continue
 
-            action = actions[i_pred]
-            action_seq.append(action)
+                action = actions[i_pred]
+                action_seq.append(action)
 
-            if len(action_seq) >= 3 and action_seq[-3:] == [action] * 3:
-                if last_action != action:
-                    last_action = action
-                    img = draw_text_on_image(img, action)
+                if len(action_seq) >= 3 and action_seq[-3:] == [action] * 3:
+                    if last_action != action:
+                        last_action = action
+                        img = draw_text_on_image(img, action)
 
         # 프레임 제한 (최대 10FPS)
         current_time = time.time()
@@ -136,6 +141,7 @@ def main():
 
     cap.release()
     cv2.destroyAllWindows()
+    face_mesh.close()
 
 if __name__ == "__main__":
     main()
